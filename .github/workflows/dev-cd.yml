@@ -1,0 +1,135 @@
+name: terraform-cd
+
+on:
+  pull_request:
+    paths:
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - ".github/workflows/dev-cd.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - ".github/workflows/dev-cd.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TF_STATE_KEY: ${{ vars.TF_STATE_KEY }}
+  TF_STATE_DDB_TABLE: ${{ vars.TF_STATE_DDB_TABLE }}
+  TF_VAR_FILE: envs/dev/dev.tfvars
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    environment: dev
+    outputs:
+      plan-exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+
+      - name: Sanity check tfvars exists
+        run: |
+          test -f "${TF_VAR_FILE}" || (echo "Missing tfvars file: ${TF_VAR_FILE}" && ls -la envs/dev/ && exit 1)
+
+      - name: Debug (non-secret vars)
+        run: |
+          echo "AWS_REGION=${AWS_REGION}"
+          echo "TF_STATE_BUCKET=${TF_STATE_BUCKET}"
+          echo "TF_STATE_KEY=${TF_STATE_KEY}"
+          echo "TF_STATE_DDB_TABLE=${TF_STATE_DDB_TABLE}"
+          echo "TF_VAR_FILE=${TF_VAR_FILE}"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform init (remote backend)
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${TF_STATE_DDB_TABLE}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -var-file="${TF_VAR_FILE}" -out=tfplan -detailed-exitcode
+          exitcode=$?
+          echo "exitcode=$exitcode" >> $GITHUB_OUTPUT
+          if [ "$exitcode" -eq 1 ]; then
+            exit 1
+          fi
+          exit 0
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+
+      - name: Debug apply condition inputs
+        run: |
+          echo "github.ref=${{ github.ref }}"
+          echo "plan-exitcode=${{ steps.plan.outputs.exitcode }}"
+          echo "plan-result=${{ job.status }}"
+
+
+  apply:
+    if: github.ref == 'refs/heads/main' && needs.plan.result == 'success'
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+
+      - name: Sanity check tfvars exists
+        run: |
+          test -f "${TF_VAR_FILE}" || (echo "Missing tfvars file: ${TF_VAR_FILE}" && ls -la envs/dev && exit 1)
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+
+      - name: Terraform init (remote backend)
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${TF_STATE_DDB_TABLE}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform apply (approved)
+        run: terraform apply -auto-approve tfplan
